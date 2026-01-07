@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "browser-logger": {
+      "command": "node",
+      "args": [
+        "E:/Github/mcp-browser-logger/dist/index.js"
+      ]
+    }
+  }
+}

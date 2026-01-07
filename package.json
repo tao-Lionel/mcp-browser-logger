@@ -1,0 +1,35 @@
+{
+  "name": "mcp-browser-logger",
+  "version": "1.0.0",
+  "description": "MCP 服务器，用于通过 Chrome DevTools Protocol 收集浏览器控制台日志和网络请求",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-browser-logger": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "browser",
+    "chrome-devtools-protocol",
+    "logging",
+    "debugging"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "puppeteer-core": "^23.11.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2"
+  }
+}
