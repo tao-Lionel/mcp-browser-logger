@@ -59,6 +59,8 @@ interface BrowserConnection {
   networkRequests: NetworkRequest[];
   nextMessageId: number;
   maxMessages: number;
+  browserType: 'chrome' | 'firefox' | null;
+  currentTab: string | null;
 }
 
 const browser: BrowserConnection = {
@@ -68,16 +70,24 @@ const browser: BrowserConnection = {
   networkRequests: [],
   nextMessageId: 1,
   maxMessages: 1000, // 最多保存 1000 条消息
+  browserType: null,
+  currentTab: null,
 };
 
 // 工具定义
 const TOOLS: Tool[] = [
   {
     name: 'connect_browser',
-    description: '连接到浏览器的 DevTools Protocol（需要先用 --remote-debugging-port=9222 启动浏览器）',
+    description: '连接到浏览器的 DevTools Protocol。支持 Chrome 和 Firefox。\n\nChrome 启动方式:\nWindows: chrome.exe --remote-debugging-port=9222\nmacOS: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222\nLinux: google-chrome --remote-debugging-port=9222\n\nFirefox 启动方式:\nWindows: firefox.exe --start-debugger-server 6000\nmacOS: /Applications/Firefox.app/Contents/MacOS/firefox --start-debugger-server 6000\nLinux: firefox --start-debugger-server 6000',
     inputSchema: {
       type: 'object',
       properties: {
+        browserType: {
+          type: 'string',
+          description: '浏览器类型',
+          enum: ['chrome', 'firefox'],
+          default: 'chrome',
+        },
         host: {
           type: 'string',
           description: '浏览器调试主机地址',
@@ -85,7 +95,36 @@ const TOOLS: Tool[] = [
         },
         port: {
           type: 'number',
-          description: '浏览器调试端口',
+          description: '浏览器调试端口（Chrome 默认 9222，Firefox 默认 6000）',
+          default: 9222,
+        },
+        tabIndex: {
+          type: 'number',
+          description: '要连接的标签页索引（从 0 开始，留空则连接第一个标签页）。使用 get_browser_tabs 查看所有可用标签页',
+        },
+      },
+    },
+  },
+  {
+    name: 'get_browser_tabs',
+    description: '列出浏览器中所有可用的标签页，用于选择要连接的标签页',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        browserType: {
+          type: 'string',
+          description: '浏览器类型',
+          enum: ['chrome', 'firefox'],
+          default: 'chrome',
+        },
+        host: {
+          type: 'string',
+          description: '浏览器调试主机地址',
+          default: 'localhost',
+        },
+        port: {
+          type: 'number',
+          description: '浏览器调试端口（Chrome 默认 9222，Firefox 默认 6000）',
           default: 9222,
         },
       },
@@ -185,87 +224,162 @@ const TOOLS: Tool[] = [
   },
 ];
 
-// 连接到浏览器
-async function connectToBrowser(host: string, port: number): Promise<string> {
-  if (browser.connected && browser.ws) {
-    return '已经连接到浏览器';
+// Firefox 辅助函数：获取标签页列表
+async function getFirefoxTabs(host: string, port: number): Promise<Array<{ actor: string; title: string; url: string }>> {
+  const response = await fetch(`http://${host}:${port}/json/list`);
+  if (!response.ok) {
+    throw new Error(`无法连接到 Firefox 调试端口 ${port}`);
+  }
+  const data = await response.json();
+  return data;
+}
+
+// Firefox 辅助函数：连接到标签页
+async function connectToFirefoxTab(host: string, port: number, tabIndex: number): Promise<string> {
+  const tabs = await getFirefoxTabs(host, port);
+  if (!tabs || tabs.length === 0) {
+    throw new Error('Firefox 中没有打开的标签页');
+  }
+  if (tabIndex >= tabs.length) {
+    throw new Error(`标签页索引 ${tabIndex} 超出范围，共有 ${tabs.length} 个标签页`);
   }
 
-  try {
-    // 1. 获取浏览器 WebSocket URL
-    const response = await fetch(`http://${host}:${port}/json`);
-    if (!response.ok) {
-      throw new Error(`无法连接到浏览器调试端口 ${port}，请确保使用 --remote-debugging-port=${port} 启动浏览器`);
-    }
+  const tab = tabs[tabIndex];
+  const wsUrl = `ws://${host}:${port}${tab.actor}`;
+  browser.currentTab = tab.actor;
 
-    const tabs = await response.json();
-    if (!tabs || tabs.length === 0) {
-      throw new Error('浏览器中没有打开的标签页');
-    }
+  return new Promise((resolve, reject) => {
+    browser.ws = new WebSocket(wsUrl);
 
-    // 使用第一个标签页（通常是激活的）
-    const wsUrl = tabs[0].webSocketDebuggerUrl;
-    if (!wsUrl) {
-      throw new Error('无法获取 WebSocket 调试 URL');
-    }
+    browser.ws.on('open', async () => {
+      browser.connected = true;
 
-    // 2. 连接 WebSocket
-    return new Promise((resolve, reject) => {
-      browser.ws = new WebSocket(wsUrl);
+      // Firefox 需要通过 WebSocket 发送消息来启用功能
+      // 发送初始消息以开始接收事件
+      await sendFirefoxCommand('consoleAPICall', {});
+      await sendFirefoxCommand('pageError', {});
 
-      browser.ws.on('open', async () => {
-        browser.connected = true;
-
-        // 启用必要的域
-        await sendCommand('Runtime.enable');
-        await sendCommand('Log.enable');
-        await sendCommand('Network.enable');
-        await sendCommand('Console.enable');
-
-        resolve(`已连接到浏览器 (${tabs[0].title} - ${tabs[0].url})`);
-      });
-
-      browser.ws.on('message', (data: Buffer) => {
-        try {
-          const message = JSON.parse(data.toString());
-
-          // 处理控制台消息
-          if (message.method === 'Runtime.consoleAPICalled') {
-            handleConsoleAPICalled(message.params);
-          }
-          // 处理日志消息
-          else if (message.method === 'Log.entryAdded') {
-            handleLogEntryAdded(message.params);
-          }
-          // 处理网络请求
-          else if (message.method === 'Network.requestWillBeSent') {
-            handleNetworkRequest(message.params);
-          }
-          else if (message.method === 'Network.responseReceived') {
-            handleNetworkResponse(message.params);
-          }
-          // 处理 JavaScript 异常
-          else if (message.method === 'Runtime.exceptionThrown') {
-            handleExceptionThrown(message.params);
-          }
-        } catch (error) {
-          console.error('[MCP] 处理消息失败:', error);
-        }
-      });
-
-      browser.ws.on('error', (error) => {
-        browser.connected = false;
-        reject(new Error(`WebSocket 连接错误: ${error}`));
-      });
-
-      browser.ws.on('close', () => {
-        browser.connected = false;
-        browser.ws = null;
-      });
+      resolve(`已连接到 Firefox (${tab.title} - ${tab.url})`);
     });
+
+    setupWebSocketHandlers(resolve, reject);
+  });
+}
+
+// Chrome 辅助函数：获取标签页列表
+async function getChromeTabs(host: string, port: number): Promise<Array<{ id: string; title: string; url: string; webSocketDebuggerUrl: string }>> {
+  const response = await fetch(`http://${host}:${port}/json`);
+  if (!response.ok) {
+    throw new Error(`无法连接到 Chrome 调试端口 ${port}`);
+  }
+  const tabs = await response.json();
+  return tabs;
+}
+
+// Chrome 辅助函数：连接到标签页
+async function connectToChromeTab(host: string, port: number, tabIndex?: number): Promise<string> {
+  const tabs = await getChromeTabs(host, port);
+  if (!tabs || tabs.length === 0) {
+    throw new Error('Chrome 中没有打开的标签页');
+  }
+  if (tabIndex !== undefined && tabIndex >= tabs.length) {
+    throw new Error(`标签页索引 ${tabIndex} 超出范围，共有 ${tabs.length} 个标签页`);
+  }
+
+  const index = tabIndex ?? 0;
+  const tab = tabs[index];
+
+  if (!tab.webSocketDebuggerUrl) {
+    throw new Error('无法获取标签页的 WebSocket 调试 URL');
+  }
+
+  browser.currentTab = tab.id;
+
+  return new Promise((resolve, reject) => {
+    browser.ws = new WebSocket(tab.webSocketDebuggerUrl);
+
+    browser.ws.on('open', async () => {
+      browser.connected = true;
+
+      // 启用必要的 CDP 域
+      await sendCommand('Runtime.enable');
+      await sendCommand('Log.enable');
+      await sendCommand('Network.enable');
+      await sendCommand('Console.enable');
+
+      resolve(`已连接到 Chrome (${tab.title} - ${tab.url})`);
+    });
+
+    setupWebSocketHandlers(resolve, reject);
+  });
+}
+
+// 设置 WebSocket 消息处理器
+function setupWebSocketHandlers(resolve: (value: string) => void, reject: (reason?: Error) => void) {
+  if (!browser.ws) return;
+
+  browser.ws.on('message', (data: Buffer) => {
+    try {
+      const message = JSON.parse(data.toString());
+
+      // Chrome CDP 事件处理
+      if (browser.browserType === 'chrome') {
+        if (message.method === 'Runtime.consoleAPICalled') {
+          handleConsoleAPICalled(message.params);
+        } else if (message.method === 'Log.entryAdded') {
+          handleLogEntryAdded(message.params);
+        } else if (message.method === 'Network.requestWillBeSent') {
+          handleNetworkRequest(message.params);
+        } else if (message.method === 'Network.responseReceived') {
+          handleNetworkResponse(message.params);
+        } else if (message.method === 'Runtime.exceptionThrown') {
+          handleExceptionThrown(message.params);
+        }
+      }
+      // Firefox 调试协议事件处理
+      else if (browser.browserType === 'firefox') {
+        if (message.type === 'consoleAPICall') {
+          handleFirefoxConsoleAPI(message);
+        } else if (message.type === 'pageError') {
+          handleFirefoxPageError(message);
+        }
+      }
+    } catch (error) {
+      console.error('[MCP] 处理消息失败:', error);
+    }
+  });
+
+  browser.ws.on('error', (error) => {
+    browser.connected = false;
+    reject(new Error(`WebSocket 连接错误: ${error}`));
+  });
+
+  browser.ws.on('close', () => {
+    browser.connected = false;
+    browser.ws = null;
+  });
+}
+
+// 主连接函数
+async function connectToBrowser(browserType: 'chrome' | 'firefox', host: string, port: number, tabIndex?: number): Promise<string> {
+  if (browser.connected && browser.ws) {
+    return `已经连接到 ${browserType}`;
+  }
+
+  browser.browserType = browserType;
+
+  try {
+    if (browserType === 'firefox') {
+      const index = tabIndex ?? 0;
+      return await connectToFirefoxTab(host, port, index);
+    } else {
+      return await connectToChromeTab(host, port, tabIndex);
+    }
   } catch (error) {
     browser.connected = false;
     browser.ws = null;
+    browser.browserType = null;
+    browser.currentTab = null;
     throw error;
   }
 }
@@ -298,6 +412,58 @@ function sendCommand(method: string, params?: Record<string, unknown>): Promise<
 
     browser.ws.send(JSON.stringify(message));
   });
+}
+
+// 发送 Firefox 调试命令
+function sendFirefoxCommand(type: string, message: Record<string, unknown>): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    if (!browser.ws || !browser.connected) {
+      reject(new Error('浏览器未连接'));
+      return;
+    }
+
+    const packet = {
+      to: browser.currentTab,
+      type,
+      message,
+    };
+
+    // Firefox 协议是单向的，不等待响应
+    browser.ws.send(JSON.stringify(packet));
+    resolve(undefined);
+  });
+}
+
+// 处理 Firefox 控制台 API
+function handleFirefoxConsoleAPI(data: { message: { level: string; arguments: Array<unknown> } }) {
+  const level = data.message.level as ConsoleMessage['level'];
+  const args = data.message.arguments;
+
+  const message: ConsoleMessage = {
+    level,
+    source: 'firefox-console',
+    text: args.map(arg => String(arg)).join(' '),
+    timestamp: Date.now(),
+    args: args as Array<unknown>,
+  };
+
+  addMessage(message);
+}
+
+// 处理 Firefox 页面错误
+function handleFirefoxPageError(data: { pageError: { errorMessage: string; sourceName?: string; lineNumber?: number } }) {
+  const error = data.pageError;
+
+  const message: ConsoleMessage = {
+    level: 'error',
+    source: 'firefox-error',
+    text: error.errorMessage,
+    timestamp: Date.now(),
+    url: error.sourceName,
+    lineNumber: error.lineNumber,
+  };
+
+  addMessage(message);
 }
 
 // 处理控制台 API 调用
@@ -475,12 +641,48 @@ async function main() {
     try {
       switch (name) {
         case 'connect_browser': {
+          const browserType = (args?.browserType as 'chrome' | 'firefox') || 'chrome';
           const host = (args?.host as string) || 'localhost';
-          const port = (args?.port as number) || 9222;
-          const result = await connectToBrowser(host, port);
+          const port = (args?.port as number) || (browserType === 'firefox' ? 6000 : 9222);
+          const tabIndex = args?.tabIndex as number | undefined;
+          const result = await connectToBrowser(browserType, host, port, tabIndex);
           return {
             content: [{ type: 'text', text: result }],
           };
+        }
+
+        case 'get_browser_tabs': {
+          const browserType = (args?.browserType as 'chrome' | 'firefox') || 'chrome';
+          const host = (args?.host as string) || 'localhost';
+          const port = (args?.port as number) || (browserType === 'firefox' ? 6000 : 9222);
+
+          try {
+            let tabs: Array<Record<string, string>>;
+            if (browserType === 'firefox') {
+              tabs = await getFirefoxTabs(host, port);
+            } else {
+              tabs = await getChromeTabs(host, port);
+            }
+
+            if (tabs.length === 0) {
+              return {
+                content: [{ type: 'text', text: '浏览器中没有打开的标签页' }],
+              };
+            }
+
+            const text = tabs.map((tab, index) => {
+              return `[${index}] ${tab.title}\n    URL: ${tab.url}`;
+            }).join('\n\n');
+
+            return {
+              content: [{ type: 'text', text: `共有 ${tabs.length} 个标签页:\n\n${text}` }],
+            };
+          } catch (error) {
+            return {
+              content: [{ type: 'text', text: `获取标签页失败: ${error instanceof Error ? error.message : String(error)}` }],
+              isError: true,
+            };
+          }
         }
 
         case 'disconnect_browser': {
@@ -489,6 +691,8 @@ async function main() {
             browser.ws = null;
           }
           browser.connected = false;
+          browser.browserType = null;
+          browser.currentTab = null;
           return {
             content: [{ type: 'text', text: '已断开浏览器连接' }],
           };
